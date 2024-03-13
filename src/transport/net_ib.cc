@@ -71,6 +71,7 @@ struct ncclIbDev ncclIbDevs[MAX_IB_DEVS];
 struct userIbDev userIbDevs[MAX_IB_DEVS];
 pthread_mutex_t ncclIbLock = PTHREAD_MUTEX_INITIALIZER;
 static int ncclIbRelaxedOrderingEnabled = 0;
+static int ncclIbUseSendRecv = 0;
 
 NCCL_PARAM(IbGidIndex, "IB_GID_INDEX", 0);
 NCCL_PARAM(IbTimeout, "IB_TIMEOUT", 18);
@@ -82,6 +83,7 @@ NCCL_PARAM(IbTc, "IB_TC", 0);
 NCCL_PARAM(IbArThreshold, "IB_AR_THRESHOLD", 8192);
 NCCL_PARAM(IbPciRelaxedOrdering, "IB_PCI_RELAXED_ORDERING", 2);
 NCCL_PARAM(IbAdaptiveRouting, "IB_ADAPTIVE_ROUTING", -2);
+NCCL_PARAM(IbUseSendRecv, "IB_USE_SEND_RECV", 0);
 
 pthread_t ncclIbAsyncThread;
 static void* ncclIbAsyncThreadMain(void* args) {
@@ -255,6 +257,8 @@ ncclResult_t ncclIbInit(ncclDebugLogger_t logFunction) {
       line[0] = '\0';
       // Determine whether RELAXED_ORDERING is enabled and possible
       ncclIbRelaxedOrderingEnabled = ncclIbRelaxedOrderingCapable();
+      // Use SEND/RECV or WRITE
+      ncclIbUseSendRecv = ncclParamIbUseSendRecv();
       for (int d=0; d<ncclNIbDevs; d++) {
         snprintf(line+strlen(line), 1023-strlen(line), " [%d]%s:%d/%s", d, ncclIbDevs[d].devName,
             ncclIbDevs[d].port, ncclIbDevs[d].link == IBV_LINK_LAYER_INFINIBAND ? "IB" : "RoCE");
@@ -263,6 +267,7 @@ ncclResult_t ncclIbInit(ncclDebugLogger_t logFunction) {
       char addrline[SOCKET_NAME_MAXLEN+1];
       INFO(NCCL_INIT|NCCL_NET, "NET/IB : Using%s %s; OOB %s:%s", line, ncclIbRelaxedOrderingEnabled ? "[RO]" : "",
            ncclIbIfName, ncclSocketToString(&ncclIbIfAddr, addrline));
+      INFO(NCCL_INIT|NCCL_NET, "NET/IB : Using %s", ncclIbUseSendRecv ? "SEND" : "WRITE");
     }
     pthread_mutex_unlock(&ncclIbLock);
   }
@@ -483,10 +488,14 @@ struct ncclIbRecvComm {
   struct ncclIbVerbs verbs;
   struct ncclIbRemFifo remFifo;
   struct ncclSocket sock;
+  struct ncclIbRequest* recvReqs[MAX_REQUESTS][NCCL_NET_IB_MAX_RECVS];
   int ready;
   struct ibv_qp* qps[NCCL_IB_MAX_QPS];
   int nqps;
   int qpIndex;
+  int ar;
+  struct ibv_sge sges[NCCL_NET_IB_MAX_RECVS];
+  struct ibv_recv_wr wrs[NCCL_NET_IB_MAX_RECVS+1];
   struct ncclIbGpuFlush gpuFlush;
   struct ncclIbGidInfo gidInfo;
 };
@@ -512,6 +521,10 @@ ncclResult_t ncclIbInitVerbs(int dev, struct ibv_context* ctx, struct ncclIbVerb
 
   // Recv requests can generate 2 completions (one for the post FIFO, one for the Recv).
   NCCLCHECK(wrap_ibv_create_cq(&verbs->cq, ctx, 2*MAX_REQUESTS*ncclParamIbQpsPerConn(), NULL, NULL, 0));
+  if (ncclIbUseSendRecv && ncclParamIbQpsPerConn()>1) {
+    WARN("NET/IB : SEND/RECV not implemented for multiple QPs");
+    return ncclInternalError;
+  }
   return ncclSuccess;
 }
 
@@ -643,7 +656,7 @@ ib_connect_check:
   ib_port = ncclIbDevs[dev].port;
   comm->nqps = ncclParamIbQpsPerConn();
   for (int q=0; q<comm->nqps; q++) {
-    NCCLCHECK(ncclIbCreateQp(ib_port, &comm->verbs, IBV_ACCESS_REMOTE_WRITE, comm->qps+q));
+    NCCLCHECK(ncclIbCreateQp(ib_port, &comm->verbs, IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_LOCAL_WRITE, comm->qps+q));
   }
   comm->ar = ncclIbDevs[dev].ar; // ADAPTIVE_ROUTING
 
@@ -774,7 +787,7 @@ ib_recv:
   NCCLCHECK(ncclIbInitVerbs(lComm->dev, ctx, &rComm->verbs));
   rComm->nqps = ncclParamIbQpsPerConn();
   for (int q=0; q<rComm->nqps; q++) {
-    NCCLCHECK(ncclIbCreateQp(ib_port, &rComm->verbs, IBV_ACCESS_REMOTE_WRITE, rComm->qps+q));
+    NCCLCHECK(ncclIbCreateQp(ib_port, &rComm->verbs, IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_LOCAL_WRITE, rComm->qps+q));
   }
 
   // Adjust the MTU
@@ -842,6 +855,7 @@ ib_recv_ready:
   if (stage->offset != sizeof(int)) return ncclSuccess;
 
   free(stage->buffer);
+  rComm->ar = ncclIbDevs[lComm->dev].ar; // ADAPTIVE_ROUTING
   *recvComm = rComm;
 
   /* reset lComm stage */
@@ -982,10 +996,12 @@ ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot) {
     sge->addr=(uintptr_t)reqs[r]->send.data;
     sge->lkey=reqs[r]->send.lkey;
 
-    wr->opcode = IBV_WR_RDMA_WRITE;
+    wr->opcode = ncclIbUseSendRecv ? IBV_WR_SEND : IBV_WR_RDMA_WRITE;
     wr->send_flags = 0;
-    wr->wr.rdma.remote_addr = slots[r].addr;
-    wr->wr.rdma.rkey = slots[r].rkey;
+    if (!ncclIbUseSendRecv) {
+      wr->wr.rdma.remote_addr = slots[r].addr;
+      wr->wr.rdma.rkey = slots[r].rkey;
+    }
     wr->next = wr+1;
     wr_id += (reqs[r] - comm->verbs.reqs) << (r*8);
   }
@@ -1014,7 +1030,7 @@ ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot) {
     memset(lastWr, 0, sizeof(struct ibv_send_wr));
   }
   lastWr->wr_id = wr_id;
-  lastWr->opcode = IBV_WR_RDMA_WRITE_WITH_IMM;
+  lastWr->opcode = ncclIbUseSendRecv ? IBV_WR_SEND_WITH_IMM : IBV_WR_RDMA_WRITE_WITH_IMM;
   lastWr->imm_data = immData;
   lastWr->next = NULL;
   lastWr->send_flags = IBV_SEND_SIGNALED;
@@ -1043,7 +1059,9 @@ ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot) {
       int chunkSize = DIVUP(DIVUP(reqs[r]->send.size, nqps), align) * align;
       reqs[r]->send.offset += chunkSize;
       comm->sges[r].addr += chunkSize;
-      comm->wrs[r].wr.rdma.remote_addr += chunkSize;
+      if (!ncclIbUseSendRecv){
+        comm->wrs[r].wr.rdma.remote_addr += chunkSize;
+      }
     }
   }
 
@@ -1197,21 +1215,46 @@ ncclResult_t ncclIbIrecv(void* recvComm, int n, void** data, int* sizes, int* ta
   req->nreqs = n;
   if (comm->gidInfo.link_layer == IBV_LINK_LAYER_ETHERNET) req->gidInfo = &comm->gidInfo;
   for (int i=0; i<n; i++) req->recv.sizes[i] = 0;
-
-  struct ibv_recv_wr wr;
-  memset(&wr, 0, sizeof(wr));
-  wr.wr_id = req - comm->verbs.reqs;
-
-  wr.sg_list = NULL;
-  wr.num_sge = 0;
-
   TIME_START(1);
   const int nqps = ncclParamIbSplitDataOnQps() ? comm->nqps : 1;
-  for (int q=0; q<nqps; q++) {
-    struct ibv_qp* qp = comm->qps[comm->qpIndex];
-    struct ibv_recv_wr* bad_wr;
-    NCCLCHECK(wrap_ibv_post_recv(qp, &wr, &bad_wr));
+
+  if (!ncclIbUseSendRecv) {
+    struct ibv_recv_wr wr;
+    memset(&wr, 0, sizeof(wr));
+    wr.wr_id = req - comm->verbs.reqs;
+
+    wr.sg_list = NULL;
+    wr.num_sge = 0;
+
+    for (int q=0; q<nqps; q++) {
+      struct ibv_qp* qp = comm->qps[comm->qpIndex];
+      struct ibv_recv_wr* bad_wr;
+      NCCLCHECK(wrap_ibv_post_recv(qp, &wr, &bad_wr));
+      comm->qpIndex = (comm->qpIndex+1)%comm->nqps;
+    }
+  } else {
+    // TODO: Implement for multiple QPs
+    for (int r=0; r<n; r++) {
+      struct ibv_recv_wr* wr = comm->wrs+r;
+      memset(wr, 0, sizeof(struct ibv_recv_wr));
+      struct ibv_sge* sge = comm->sges+r;
+      sge->addr=(uintptr_t)data[r];
+      struct ibv_mr* mr = (struct ibv_mr*)mhandles[r];
+      sge->lkey=mr->lkey;
+      sge->length=static_cast<uint32_t>(sizes[r]);
+      wr->next = wr+1;
+      wr->sg_list = (sizes[r] == 0) ? NULL : sge;
+      wr->num_sge = (sizes[r] == 0) ? 0 : 1;
+      wr->wr_id = req - comm->verbs.reqs;
+    }
+
+    struct ibv_recv_wr* lastWr = comm->wrs+n-1;
+    lastWr->wr_id = req - comm->verbs.reqs;
+    lastWr->next = NULL;
+
+    struct ibv_recv_wr *bad_wr;
     comm->qpIndex = (comm->qpIndex+1)%comm->nqps;
+    NCCLCHECK(wrap_ibv_post_recv(comm->qps[comm->qpIndex], comm->wrs, &bad_wr));
   }
   TIME_STOP(1);
   req->events = nqps;
@@ -1306,7 +1349,7 @@ ncclResult_t ncclIbTest(void* request, int* done, int* sizes) {
           sendReq->events--;
         }
       } else {
-        if (req && wc->opcode == IBV_WC_RECV_RDMA_WITH_IMM) {
+        if (req && ( wc->wc_flags == IBV_WC_WITH_IMM || wc->opcode == IBV_WC_RECV_RDMA_WITH_IMM )) {
           if (req->type != NCCL_NET_IB_REQ_RECV) return ncclInternalError;
           if (req->nreqs > 1) {
             // In the case of a multi recv, we only set sizes to 0 or 1.
